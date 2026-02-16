@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -170,7 +171,11 @@ func createVoIPDiscoverHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 				keywords = make([]string, 0, len(kwArr))
 				for _, kw := range kwArr {
 					if s, ok := kw.(string); ok && s != "" {
-						keywords = append(keywords, s)
+						// Sanitize each keyword to prevent grep regex injection
+						safe := sanitizeAlphanumeric(s)
+						if safe != "" {
+							keywords = append(keywords, safe)
+						}
 					}
 				}
 				if len(keywords) == 0 {
@@ -179,9 +184,9 @@ func createVoIPDiscoverHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			}
 		}
 
-		// Build grep pattern
-		pattern := strings.Join(keywords, "\\|")
-		cmd := fmt.Sprintf(`docker ps --format '{{.Names}}|{{.Image}}' | grep -iE '%s' 2>/dev/null || echo ''`, pattern)
+		// Build grep pattern (keywords are sanitized to alphanumeric only)
+		pattern := strings.Join(keywords, "|")
+		cmd := fmt.Sprintf(`docker ps --format '{{.Names}}|{{.Image}}' | grep -iE %s 2>/dev/null || echo ''`, shellQuote(pattern))
 
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
@@ -245,12 +250,12 @@ func createSIPCaptureHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		// Run sngrep capture
 		cmd := fmt.Sprintf("docker exec %s timeout %ds sngrep -N -q -d any -O %s '%s' 2>&1 || true",
-			shellQuote(container), duration, pcapPath, bpfFilter)
+			shellQuote(container), duration, shellQuote(pcapPath), bpfFilter)
 
 		mgr.Execute(ctx, cmd, target) // Ignore timeout error (expected with captures)
 
 		// Verify PCAP file was created
-		checkFile := fmt.Sprintf("docker exec %s test -f %s && echo 'exists' || echo 'missing'", shellQuote(container), pcapPath)
+		checkFile := fmt.Sprintf("docker exec %s test -f %s && echo 'exists' || echo 'missing'", shellQuote(container), shellQuote(pcapPath))
 		checkResult, _ := mgr.Execute(ctx, checkFile, target)
 		fileStatus := "created"
 		if !containsString(checkResult, "exists") {
@@ -279,11 +284,16 @@ func createCallFlowHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		}
 
 		container, _ := req.RequireString("container")
-		pcapFile, _ := req.RequireString("pcap_file")
+		rawPcapFile, _ := req.RequireString("pcap_file")
 		callID := req.GetString("call_id", "")
 		phoneNumber := req.GetString("phone_number", "")
 		summaryOnly := req.GetBool("summary_only", false)
 		target := req.GetString("target", "primary")
+
+		pcapFile, err := sanitizeShellInnerPath(rawPcapFile)
+		if err != nil {
+			return mcp.NewToolResultError("invalid pcap_file path"), nil
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -292,20 +302,19 @@ func createCallFlowHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		// Use tshark for PCAP analysis (most reliable)
 		var filter string
 		if callID != "" {
-			filter = fmt.Sprintf("-Y 'sip.Call-ID == \"%s\"'", callID)
+			filter = fmt.Sprintf("-Y 'sip.Call-ID == \"%s\"'", sanitizeTsharkValue(callID))
 		} else if phoneNumber != "" {
-			filter = fmt.Sprintf("-Y 'sip contains \"%s\"'", phoneNumber)
+			filter = fmt.Sprintf("-Y 'sip contains \"%s\"'", sanitizeTsharkValue(phoneNumber))
 		}
 
+		quotedPcap := shellQuote(pcapFile)
 		var cmd string
 		if summaryOnly {
-			// Get summary: method, response codes, call-ids
 			cmd = fmt.Sprintf(`docker exec %s sh -c 'if command -v tshark >/dev/null 2>&1; then tshark -r %s -T fields -e frame.time -e ip.src -e ip.dst -e sip.Method -e sip.Status-Code -e sip.Call-ID %s 2>/dev/null | head -100; else sngrep -I %s -q 2>/dev/null | head -50 || echo "No analysis tool available"; fi'`,
-				shellQuote(container), pcapFile, filter, pcapFile)
+				shellQuote(container), quotedPcap, filter, quotedPcap)
 		} else {
-			// Get detailed call flow
 			cmd = fmt.Sprintf(`docker exec %s sh -c 'if command -v tshark >/dev/null 2>&1; then tshark -r %s -V -Y sip %s 2>/dev/null | head -500; else cat %s 2>/dev/null | strings | grep -E "^(INVITE|REGISTER|BYE|ACK|CANCEL|SIP/2.0)" | head -100 || echo "No analysis tool available"; fi'`,
-				shellQuote(container), pcapFile, filter, pcapFile)
+				shellQuote(container), quotedPcap, filter, quotedPcap)
 		}
 
 		output, err := mgr.Execute(ctx, cmd, target)
@@ -325,16 +334,22 @@ func createRegistrationsHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		}
 
 		container, _ := req.RequireString("container")
-		pcapFile, _ := req.RequireString("pcap_file")
+		rawPcapFile, _ := req.RequireString("pcap_file")
 		target := req.GetString("target", "primary")
+
+		pcapFile, err := sanitizeShellInnerPath(rawPcapFile)
+		if err != nil {
+			return mcp.NewToolResultError("invalid pcap_file path"), nil
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
+		quotedPcap := shellQuote(pcapFile)
 		// Extract REGISTER dialogs using tshark or strings
 		cmd := fmt.Sprintf(`docker exec %s sh -c 'if command -v tshark >/dev/null 2>&1; then tshark -r %s -Y "sip.Method == REGISTER or (sip.CSeq.method == REGISTER and sip.Status-Code)" -T fields -e frame.time -e sip.from.user -e sip.to.user -e sip.contact.uri -e sip.Status-Code -E header=y 2>/dev/null; else cat %s 2>/dev/null | strings | grep -E "(REGISTER|200 OK|401|403)" | head -50; fi'`,
-			shellQuote(container), pcapFile, pcapFile)
+			shellQuote(container), quotedPcap, quotedPcap)
 
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
@@ -353,13 +368,19 @@ func createCallStatsHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		}
 
 		container, _ := req.RequireString("container")
-		pcapFile, _ := req.RequireString("pcap_file")
+		rawPcapFile, _ := req.RequireString("pcap_file")
 		target := req.GetString("target", "primary")
+
+		pcapFile, err := sanitizeShellInnerPath(rawPcapFile)
+		if err != nil {
+			return mcp.NewToolResultError("invalid pcap_file path"), nil
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
+		quotedPcap := shellQuote(pcapFile)
 		// Aggregate stats using tshark
 		cmd := fmt.Sprintf(`docker exec %s sh -c '
 if command -v tshark >/dev/null 2>&1; then
@@ -375,7 +396,7 @@ if command -v tshark >/dev/null 2>&1; then
   tshark -r %s -Y sip -T fields -e sip.Call-ID 2>/dev/null | sort -u | wc -l | xargs echo "Total calls:"
 else
   cat %s 2>/dev/null | strings | grep -oE "^(INVITE|REGISTER|BYE|ACK|CANCEL|OPTIONS|SIP/2.0 [0-9]+)" | sort | uniq -c | sort -rn
-fi'`, shellQuote(container), pcapFile, pcapFile, pcapFile, pcapFile)
+fi'`, shellQuote(container), quotedPcap, quotedPcap, quotedPcap, quotedPcap)
 
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
@@ -394,9 +415,14 @@ func createExtractSDPHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		}
 
 		container, _ := req.RequireString("container")
-		pcapFile, _ := req.RequireString("pcap_file")
+		rawPcapFile, _ := req.RequireString("pcap_file")
 		callID := req.GetString("call_id", "")
 		target := req.GetString("target", "primary")
+
+		pcapFile, err := sanitizeShellInnerPath(rawPcapFile)
+		if err != nil {
+			return mcp.NewToolResultError("invalid pcap_file path"), nil
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -404,14 +430,15 @@ func createExtractSDPHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		var filter string
 		if callID != "" {
-			filter = fmt.Sprintf("-Y 'sip.Call-ID == \"%s\" and sdp'", callID)
+			filter = fmt.Sprintf("-Y 'sip.Call-ID == \"%s\" and sdp'", sanitizeTsharkValue(callID))
 		} else {
 			filter = "-Y 'sdp'"
 		}
 
+		quotedPcap := shellQuote(pcapFile)
 		// Extract SDP with tshark
 		cmd := fmt.Sprintf(`docker exec %s sh -c 'if command -v tshark >/dev/null 2>&1; then tshark -r %s %s -T fields -e sdp.connection_info -e sdp.media -e sdp.media.port -e sdp.media.format -E header=y 2>/dev/null | head -50; else cat %s 2>/dev/null | strings | grep -E "^(c=|m=|a=rtpmap)" | head -50; fi'`,
-			shellQuote(container), pcapFile, filter, pcapFile)
+			shellQuote(container), quotedPcap, filter, quotedPcap)
 
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
@@ -431,8 +458,15 @@ func createPacketCheckHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		container, _ := req.RequireString("container")
 		duration := req.GetInt("duration", 5)
-		iface := req.GetString("interface", "any")
+		iface := sanitizeAlphanumeric(req.GetString("interface", "any"))
 		target := req.GetString("target", "primary")
+
+		if iface == "" {
+			iface = "any"
+		}
+		if duration < 1 || duration > 300 {
+			duration = 5
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -440,7 +474,7 @@ func createPacketCheckHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		// Quick packet check using tcpdump
 		cmd := fmt.Sprintf(`docker exec %s sh -c 'if command -v tcpdump >/dev/null 2>&1; then timeout %ds tcpdump -i %s -c 20 port 5060 or port 5061 2>&1 | tail -25; else echo "tcpdump not available"; fi'`,
-			shellQuote(container), duration, iface)
+			shellQuote(container), duration, shellQuote(iface))
 
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
@@ -467,8 +501,15 @@ func createNetworkCaptureHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		container, _ := req.RequireString("container")
 		duration := req.GetInt("duration", 30)
-		iface := req.GetString("interface", "any")
+		iface := sanitizeAlphanumeric(req.GetString("interface", "any"))
 		target := req.GetString("target", "primary")
+
+		if iface == "" {
+			iface = "any"
+		}
+		if duration < 1 || duration > 300 {
+			duration = 30
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -478,12 +519,12 @@ func createNetworkCaptureHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		// Capture with tcpdump
 		cmd := fmt.Sprintf(`docker exec %s sh -c 'if command -v tcpdump >/dev/null 2>&1; then timeout %ds tcpdump -i %s -w %s port 5060 or port 5061 2>&1 || true; else echo "tcpdump not available"; fi'`,
-			shellQuote(container), duration, iface, pcapPath)
+			shellQuote(container), duration, shellQuote(iface), shellQuote(pcapPath))
 
 		mgr.Execute(ctx, cmd, target) // Ignore timeout (expected with captures)
 
 		// Verify PCAP file was created
-		checkFile := fmt.Sprintf("docker exec %s test -f %s && echo 'exists' || echo 'missing'", shellQuote(container), pcapPath)
+		checkFile := fmt.Sprintf("docker exec %s test -f %s && echo 'exists' || echo 'missing'", shellQuote(container), shellQuote(pcapPath))
 		checkResult, _ := mgr.Execute(ctx, checkFile, target)
 		fileStatus := "created"
 		if !containsString(checkResult, "exists") {
@@ -514,25 +555,36 @@ func createRTPCaptureHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		container, _ := req.RequireString("container")
 		duration := req.GetInt("duration", 10)
 		portRange := req.GetString("port_range", RTPPortRange)
-		iface := req.GetString("interface", "any")
+		iface := sanitizeAlphanumeric(req.GetString("interface", "any"))
 		target := req.GetString("target", "primary")
+
+		if iface == "" {
+			iface = "any"
+		}
+		if duration < 1 || duration > 300 {
+			duration = 10
+		}
 
 		if err := checkDockerAvailable(ctx, mgr, target); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// Parse port range
+		// Parse and validate port range (must be numeric)
+		startPort := 50000
+		endPort := 60000
 		ports := strings.Split(portRange, "-")
-		startPort := "50000"
-		endPort := "60000"
 		if len(ports) == 2 {
-			startPort = ports[0]
-			endPort = ports[1]
+			if sp, err := strconv.Atoi(strings.TrimSpace(ports[0])); err == nil && sp > 0 && sp <= 65535 {
+				startPort = sp
+			}
+			if ep, err := strconv.Atoi(strings.TrimSpace(ports[1])); err == nil && ep > 0 && ep <= 65535 {
+				endPort = ep
+			}
 		}
 
 		// Capture RTP packets and count
-		cmd := fmt.Sprintf(`docker exec %s sh -c 'if command -v tcpdump >/dev/null 2>&1; then timeout %ds tcpdump -i %s -c 100 "udp portrange %s-%s" 2>&1 | tail -20; else echo "tcpdump not available"; fi'`,
-			shellQuote(container), duration, iface, startPort, endPort)
+		cmd := fmt.Sprintf(`docker exec %s sh -c 'if command -v tcpdump >/dev/null 2>&1; then timeout %ds tcpdump -i %s -c 100 "udp portrange %d-%d" 2>&1 | tail -20; else echo "tcpdump not available"; fi'`,
+			shellQuote(container), duration, shellQuote(iface), startPort, endPort)
 
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {

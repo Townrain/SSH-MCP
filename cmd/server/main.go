@@ -22,12 +22,9 @@ import (
 )
 
 const (
-	serverName    = "ssh-mcp"
-	
-	// Defaults
-	defaultMode  = "http"
-	defaultPort  = "8000"
-	defaultDebug = "false"
+	serverName  = "ssh-mcp"
+	defaultMode = "http"
+	defaultPort = "8000"
 )
 
 // UUIDv7SessionManager generates time-ordered UUIDv7 session IDs
@@ -36,11 +33,13 @@ const (
 type UUIDv7SessionManager struct {
 	mu         sync.RWMutex
 	terminated map[string]time.Time // sessionID -> termination time
+	done       chan struct{}
 }
 
 func NewUUIDv7SessionManager() *UUIDv7SessionManager {
 	mgr := &UUIDv7SessionManager{
 		terminated: make(map[string]time.Time),
+		done:       make(chan struct{}),
 	}
 	// Cleanup old terminated sessions every 10 minutes
 	go mgr.cleanupLoop()
@@ -51,16 +50,26 @@ func NewUUIDv7SessionManager() *UUIDv7SessionManager {
 func (m *UUIDv7SessionManager) cleanupLoop() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		m.mu.Lock()
-		cutoff := time.Now().Add(-1 * time.Hour)
-		for id, terminatedAt := range m.terminated {
-			if terminatedAt.Before(cutoff) {
-				delete(m.terminated, id)
+	for {
+		select {
+		case <-m.done:
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			cutoff := time.Now().Add(-1 * time.Hour)
+			for id, terminatedAt := range m.terminated {
+				if terminatedAt.Before(cutoff) {
+					delete(m.terminated, id)
+				}
 			}
+			m.mu.Unlock()
 		}
-		m.mu.Unlock()
 	}
+}
+
+// Close stops the cleanup goroutine.
+func (m *UUIDv7SessionManager) Close() {
+	close(m.done)
 }
 
 func (m *UUIDv7SessionManager) Generate() string {
@@ -92,7 +101,7 @@ func (m *UUIDv7SessionManager) Terminate(sessionID string) (bool, error) {
 	m.terminated[sessionID] = time.Now()
 	m.mu.Unlock()
 	
-	log.Printf("[SESSION] Terminated: %s", sessionID)
+	log.Printf("session terminated: %s", sessionID)
 	return false, nil // isNotAllowed=false (we allow termination)
 }
 
@@ -119,24 +128,17 @@ func main() {
 	// Initialize flags with Env/Default values
 	modeEnv := getEnv("SSH_MCP_MODE", defaultMode)
 	portEnv := getEnv("PORT", defaultPort)
-	debugEnv := getEnv("SSH_MCP_DEBUG", defaultDebug) == "true"
 	globalEnv := getEnv("SSH_MCP_GLOBAL", "false") == "true"
 
 	// Define flags (overrides envs)
 	mode := flag.String("mode", modeEnv, "Transport mode: stdio or http")
 	port := flag.String("port", portEnv, "HTTP server port (http mode only)")
-	debug := flag.Bool("debug", debugEnv, "Enable debug logging")
 	globalState := flag.Bool("global", globalEnv, "Use single shared SSH manager for all sessions")
 	flag.Parse()
 
-	// Configure logging
-	if *debug {
-		log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
-	} else {
-		log.SetFlags(log.LstdFlags)
-	}
+	log.SetFlags(log.LstdFlags)
 	
-	log.Printf("Starting %s (commit=%s, mode=%s, port=%s, global=%v)", serverName, commitSHA, *mode, *port, *globalState)
+	log.Printf("starting %s commit=%s mode=%s port=%s global=%v", serverName, commitSHA, *mode, *port, *globalState)
 
 	// Initialize SSH Pool
 	pool := ssh.NewPool(*globalState)
@@ -172,31 +174,29 @@ func createSessionHooks(pool *ssh.Pool) *server.Hooks {
 
 	hooks.AddOnRegisterSession(func(ctx context.Context, session server.ClientSession) {
 		sessionID := session.SessionID()
-		
+
 		// Check if this request has X-Session-Key - if so, use header-based pooling
 		if sessionKey, ok := ctx.Value(ssh.SessionKeyContextKey).(string); ok && sessionKey != "" {
-			// Touch the header-based manager to keep it alive
 			pool.TouchHeader(sessionKey)
-			log.Printf("[Session] Started: %s (using header pool: %s)", sessionID, sessionKey)
+			log.Printf("session started: %s (header-pool: %s)", sessionID, sessionKey)
 			return // Don't create session-based manager
 		}
-		
-		// No header - create session-based manager
-		log.Printf("[Session] Started: %s (session pool)", sessionID)
+
+		log.Printf("session started: %s", sessionID)
 		pool.CreateSession(sessionID)
 	})
 
 	hooks.AddOnUnregisterSession(func(ctx context.Context, session server.ClientSession) {
 		sessionID := session.SessionID()
-		
+
 		// If using header-based pooling, release active count (managed by timeout)
 		if sessionKey, ok := ctx.Value(ssh.SessionKeyContextKey).(string); ok && sessionKey != "" {
 			pool.ReleaseHeader(sessionKey)
-			log.Printf("[Session] Ended: %s (header pool: %s retained)", sessionID, sessionKey)
+			log.Printf("session ended: %s (header-pool: %s)", sessionID, sessionKey)
 			return
 		}
-		
-		log.Printf("[Session] Ended: %s (session pool destroyed)", sessionID)
+
+		log.Printf("session ended: %s", sessionID)
 		pool.DestroySession(sessionID)
 	})
 
@@ -223,19 +223,17 @@ const sessionKeyHeader = "X-Session-Key"
 // - Audit Logging: Track all tool invocations with user context
 func runHTTP(s *server.MCPServer, port string, pool *ssh.Pool) {
 	// Use StreamableHTTPServer with UUIDv7 session IDs and security middleware
+	sessionMgr := NewUUIDv7SessionManager()
 	httpSrv := server.NewStreamableHTTPServer(s,
 		// Use time-ordered UUIDv7 for professional session IDs
-		server.WithSessionIdManager(NewUUIDv7SessionManager()),
+		server.WithSessionIdManager(sessionMgr),
 		
 		// Extract X-Session-Key for session persistence
 		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			sessionKey := r.Header.Get(sessionKeyHeader)
 			if sessionKey != "" {
-				// TODO PRODUCTION: Validate sessionKey against authorized keys here
-				log.Printf("[SECURITY] Session key received: %s from %s", sessionKey, r.RemoteAddr)
 				return context.WithValue(ctx, ssh.SessionKeyContextKey, sessionKey)
 			}
-			log.Printf("[SECURITY] No session key provided from %s", r.RemoteAddr)
 			return ctx
 		}),
 	)
@@ -255,23 +253,28 @@ func runHTTP(s *server.MCPServer, port string, pool *ssh.Pool) {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[HTTP] Listening on :%s/mcp", port)
+		log.Printf("listening on :%s/mcp", port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server error: %v", err)
 		}
 	}()
 
 	<-sigChan
-	log.Println("[HTTP] Shutting down...")
+	log.Println("shutting down...")
 
-	// Close SSH pool first (closes all SSH connections) - instant
-	pool.Close()
-
-	// Force close HTTP server - don't wait for SSE streams
-	// SSE clients will reconnect automatically anyway
-	if err := httpServer.Close(); err != nil {
-		log.Printf("[HTTP] Close error: %v", err)
+	// Graceful HTTP shutdown with 10s deadline for in-flight requests
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown timeout, forcing: %v", err)
+		httpServer.Close()
 	}
 
-	log.Println("[HTTP] Server stopped")
+	// Stop session manager cleanup goroutine
+	sessionMgr.Close()
+
+	// Close SSH pool (closes all SSH connections)
+	pool.Close()
+
+	log.Println("server stopped")
 }

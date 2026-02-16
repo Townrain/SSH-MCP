@@ -63,7 +63,7 @@ func (km *KeyManager) EnsureKey() error {
 		if err := os.MkdirAll(keyDir, 0700); err != nil {
 			return fmt.Errorf("failed to create key directory %s: %w", keyDir, err)
 		}
-		log.Printf("[KEY] Created key directory: %s", keyDir)
+		log.Printf("ssh-key: created directory %s", keyDir)
 	} else if err != nil {
 		return fmt.Errorf("failed to access key directory %s: %w", keyDir, err)
 	} else if !stat.IsDir() {
@@ -78,11 +78,10 @@ func (km *KeyManager) EnsureKey() error {
 	os.Remove(testFile)
 
 	if _, err := os.Stat(km.keyPath); os.IsNotExist(err) {
-		log.Printf("[KEY] Generating new Ed25519 key pair at %s", km.keyPath)
+		log.Printf("ssh-key: generating new key at %s", km.keyPath)
 		return km.generateKey()
 	}
 
-	log.Printf("[KEY] Using existing key at %s", km.keyPath)
 	return nil
 }
 
@@ -116,7 +115,7 @@ func (km *KeyManager) generateKey() error {
 		return fmt.Errorf("failed to write public key: %w", err)
 	}
 
-	log.Println("[KEY] System key generated successfully")
+	log.Println("ssh-key: generated successfully")
 	return nil
 }
 

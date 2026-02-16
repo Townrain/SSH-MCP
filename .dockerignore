@@ -9,3 +9,4 @@ Dockerfile
 .vscode/
 .idea/
 tmp/
+server

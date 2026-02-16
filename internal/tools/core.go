@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"ssh-mcp/internal/ssh"
@@ -69,10 +68,8 @@ func registerCoreTools(s *server.MCPServer, pool *ssh.Pool) {
 
 func createConnectHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		log.Printf("[Tool:connect] Starting...")
 		mgr := getManager(ctx, pool)
 		if mgr == nil {
-			log.Printf("[Tool:connect] Error: No active session")
 			return mcp.NewToolResultError("No active session"), nil
 		}
 
@@ -83,8 +80,6 @@ func createConnectHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		keyPath := req.GetString("private_key_path", "")
 		alias := req.GetString("alias", "")
 		via := req.GetString("via", "")
-
-		log.Printf("[Tool:connect] Connecting to %s@%s:%d", username, host, port)
 
 		opts := ssh.ConnectOptions{
 			Host:           host,
@@ -98,11 +93,9 @@ func createConnectHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		resultAlias, err := mgr.Connect(ctx, opts)
 		if err != nil {
-			log.Printf("[Tool:connect] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		log.Printf("[Tool:connect] Success: %s", resultAlias)
 		return mcp.NewToolResultText(fmt.Sprintf("Connected to %s@%s (alias: %s)", username, host, resultAlias)), nil
 	}
 }
@@ -126,18 +119,14 @@ func createDisconnectHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 func createRunHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		log.Printf("[Tool:run] Starting...")
 		mgr := getManager(ctx, pool)
 		if mgr == nil {
-			log.Printf("[Tool:run] Error: No active session")
 			return mcp.NewToolResultError("No active session"), nil
 		}
 
 		command, _ := req.RequireString("command")
 		target := req.GetString("target", "primary")
-		timeout := req.GetInt("timeout", 120) // Default 120s like Python
-
-		log.Printf("[Tool:run] Executing: %s (target=%s, timeout=%ds)", command, target, timeout)
+		timeout := req.GetInt("timeout", 120)
 
 		// Create context with timeout
 		if timeout > 0 {
@@ -150,14 +139,11 @@ func createRunHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		output, err := mgr.Execute(ctx, command, target)
 		if err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
-				log.Printf("[Tool:run] Timeout after %ds", timeout)
 				return mcp.NewToolResultError(fmt.Sprintf("Command timed out after %ds", timeout)), nil
 			}
-			log.Printf("[Tool:run] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		log.Printf("[Tool:run] Success (%d bytes output)", len(output))
 		return mcp.NewToolResultText(output), nil
 	}
 }

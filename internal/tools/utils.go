@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"fmt"
 	"strings"
 )
 
@@ -68,4 +69,65 @@ func sedEscapeReplacement(s string) string {
 // Newlines need to be escaped with backslash continuation for multi-line inserts.
 func sedEscapeInsertText(s string) string {
 	return strings.ReplaceAll(s, "\n", `\n`)
+}
+
+// sedInPlace builds a portable sed in-place edit command that works on
+// GNU sed (Linux), BSD sed (macOS/FreeBSD), and BusyBox sed (Alpine).
+// Uses sed -i.bak + rm for universal portability.
+//
+// Parameters:
+//   - flags: extra sed flags like "-E", or "" for none
+//   - expr: the sed expression including single-quote wrapping (e.g., "'s/foo/bar/g'")
+//   - path: the raw file path (will be shell-quoted internally)
+func sedInPlace(flags, expr, path string) string {
+	quotedPath := shellQuote(path)
+	quotedBak := shellQuote(path + ".bak")
+	if flags != "" {
+		flags = " " + flags
+	}
+	return fmt.Sprintf("sed -i.bak%s %s %s 2>&1 && rm -f %s",
+		flags, expr, quotedPath, quotedBak)
+}
+
+// sanitizeTsharkValue removes characters that could break tshark display filters.
+// Allows alphanumeric, dash, dot, @, underscore, plus, colon, and space.
+func sanitizeTsharkValue(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '.' || r == '@' || r == '_' || r == '+' || r == ':' || r == ' ' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// sanitizeAlphanumeric validates that a string contains only safe characters.
+// Allows alphanumeric, dash, dot, and underscore. Used for network interface names,
+// grep keywords, and other values embedded inside sh -c strings.
+func sanitizeAlphanumeric(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '.' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// sanitizeShellInnerPath validates a file path used inside sh -c '...' strings.
+// Rejects characters that could break out of single-quoted shell context or
+// enable command injection. Returns error for unsafe paths.
+func sanitizeShellInnerPath(s string) (string, error) {
+	if s == "" {
+		return "", fmt.Errorf("path cannot be empty")
+	}
+	for _, r := range s {
+		if r == '\'' || r == '`' || r == ';' || r == '&' || r == '|' ||
+			r == '$' || r == '!' || r == '\n' || r == '\r' || r < 32 {
+			return "", fmt.Errorf("invalid characters in path")
+		}
+	}
+	return s, nil
 }

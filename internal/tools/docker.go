@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"ssh-mcp/internal/ssh"
 
@@ -175,7 +174,6 @@ func createDockerOpHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		cmd := fmt.Sprintf("docker %s %s 2>&1", shellQuote(action), shellQuote(container))
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
-			log.Printf("[Tool:docker_op] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -315,11 +313,11 @@ func createDockerCpToHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 }
 
 func checkDockerAvailable(ctx context.Context, mgr *ssh.Manager, target string) error {
-	output, err := mgr.Execute(ctx, "command -v docker >/dev/null 2>&1 && echo 'ok' || echo 'missing'", target)
+	available, err := mgr.IsDockerAvailable(ctx, target)
 	if err != nil {
 		return err
 	}
-	if !containsString(output, "ok") {
+	if !available {
 		return fmt.Errorf("docker command not found on target")
 	}
 	return nil

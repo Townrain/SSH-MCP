@@ -57,6 +57,7 @@ type Pool struct {
 	// Cleanup
 	timeout     time.Duration
 	stopCleanup chan struct{}
+	cleanupDone sync.WaitGroup
 }
 
 // NewPool creates a new session pool.
@@ -71,11 +72,11 @@ func NewPool(globalMode bool) *Pool {
 
 	if globalMode {
 		pool.global = NewManager("")
-		log.Println("[Pool] Running in global mode - single shared manager")
+		log.Println("pool: global mode enabled")
 	} else {
 		// Start cleanup goroutine
+		pool.cleanupDone.Add(1)
 		go pool.cleanupLoop()
-		log.Printf("[Pool] Started with %v session timeout", pool.timeout)
 	}
 
 	return pool
@@ -112,7 +113,6 @@ func (p *Pool) GetByHeader(headerKey string) *Manager {
 
 	if entry != nil {
 		entry.touch() // Extend expiry on every request
-		log.Printf("[Pool] Reusing manager for header: %s (expires in %v)", headerKey, p.timeout)
 		return entry.manager
 	}
 
@@ -123,12 +123,11 @@ func (p *Pool) GetByHeader(headerKey string) *Manager {
 	// Double-check after acquiring lock
 	if entry = p.headerCache[headerKey]; entry != nil {
 		entry.touch()
-		log.Printf("[Pool] Reusing manager for header: %s (after lock)", headerKey)
 		return entry.manager
 	}
 
 	// Create new
-	log.Printf("[Pool] Created new manager for header: %s (expires in %v)", headerKey, p.timeout)
+	log.Printf("pool: new header session %s", headerKey)
 	mgr := NewManager("")
 	entry = &sessionEntry{manager: mgr}
 	entry.touch()
@@ -164,7 +163,7 @@ func (p *Pool) TouchHeader(headerKey string) {
 	}
 
 	// Create new manager
-	log.Printf("[Pool] Created new manager for header: %s (expires in %v)", headerKey, p.timeout)
+	log.Printf("pool: new header session %s", headerKey)
 	mgr := NewManager("")
 	entry = &sessionEntry{manager: mgr}
 	entry.touch()
@@ -191,7 +190,6 @@ func (p *Pool) CreateSession(sessionID string) {
 	}
 
 	p.managers[sessionID] = NewManager("")
-	log.Printf("[Pool] Created manager for session %s", sessionID)
 }
 
 // DestroySession removes and closes the Manager.
@@ -210,11 +208,11 @@ func (p *Pool) DestroySession(sessionID string) {
 
 	mgr.Close()
 	delete(p.managers, sessionID)
-	log.Printf("[Pool] Destroyed manager for session %s", sessionID)
 }
 
 // cleanupLoop runs cleanup every 60 seconds for header-based sessions.
 func (p *Pool) cleanupLoop() {
+	defer p.cleanupDone.Done()
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
@@ -240,7 +238,6 @@ func (p *Pool) reap() {
 			toRemove = append(toRemove, key)
 		}
 	}
-	sessionCount := len(p.headerCache)
 	p.headerCacheMu.RUnlock()
 
 	// Second pass: remove expired (close manager outside lock to prevent deadlock)
@@ -253,7 +250,7 @@ func (p *Pool) reap() {
 			if entry.age() > p.timeout {
 				delete(p.headerCache, key)
 				mgr = entry.manager
-				log.Printf("[Pool] Expired session removed: %s", key)
+				log.Printf("pool: expired session %s", key)
 			}
 		}
 		p.headerCacheMu.Unlock()
@@ -263,13 +260,6 @@ func (p *Pool) reap() {
 		}
 	}
 
-	// Log only when there are active sessions or something was removed
-	if len(toRemove) > 0 || sessionCount > 0 {
-		remaining := sessionCount - len(toRemove)
-		if remaining > 0 {
-			log.Printf("[Pool] Active sessions: %d", remaining)
-		}
-	}
 }
 
 // Close closes all managers. Safe to call multiple times.
@@ -283,6 +273,9 @@ func (p *Pool) Close() {
 		close(p.stopCleanup)
 	}
 
+	// Wait for cleanup goroutine to finish before closing managers
+	p.cleanupDone.Wait()
+
 	// Close global
 	if p.global != nil {
 		p.global.Close()
@@ -290,8 +283,7 @@ func (p *Pool) Close() {
 
 	// Close session managers
 	p.managersMu.Lock()
-	for id, mgr := range p.managers {
-		log.Printf("[Pool] Closing session manager: %s", id)
+	for _, mgr := range p.managers {
 		mgr.Close()
 	}
 	p.managers = make(map[string]*Manager)
@@ -299,14 +291,13 @@ func (p *Pool) Close() {
 
 	// Close header cache
 	p.headerCacheMu.Lock()
-	for key, entry := range p.headerCache {
-		log.Printf("[Pool] Closing header session: %s", key)
+	for _, entry := range p.headerCache {
 		entry.manager.Close()
 	}
 	p.headerCache = make(map[string]*sessionEntry)
 	p.headerCacheMu.Unlock()
 
-	log.Println("[Pool] All managers closed")
+	log.Println("pool: closed")
 }
 
 // SessionHeader returns the header name used for session keys.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"path/filepath"
 	"strings"
 
@@ -138,7 +137,6 @@ func createReadHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		content, err := mgr.ReadFile(ctx, path, target)
 		if err != nil {
-			log.Printf("[Tool:read] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -172,7 +170,6 @@ func createWriteHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		}
 
 		if err := mgr.WriteFile(ctx, path, content, target); err != nil {
-			log.Printf("[Tool:write] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -212,14 +209,13 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			if oldText == "" {
 				return mcp.NewToolResultError("'old_text' is required for replace operation"), nil
 			}
-			// Use sed with literal string replacement via escaped special chars
-			// We pipe through sed to handle special characters properly
 			globalFlag := ""
 			if req.GetBool("global", false) {
 				globalFlag = "g"
 			}
-			cmd = fmt.Sprintf("sed -i 's/%s/%s/%s' %s 2>&1",
-				sedEscapeLiteral(oldText), sedEscapeReplacement(newText), globalFlag, shellQuote(path))
+			expr := fmt.Sprintf("'s/%s/%s/%s'",
+				sedEscapeLiteral(oldText), sedEscapeReplacement(newText), globalFlag)
+			cmd = sedInPlace("", expr, path)
 
 		case "regex":
 			pattern := req.GetString("pattern", "")
@@ -231,8 +227,9 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			if !req.GetBool("global", true) {
 				globalFlag = ""
 			}
-			cmd = fmt.Sprintf("sed -i -E 's/%s/%s/%s' %s 2>&1",
-				sedEscapePattern(pattern), sedEscapeReplacement(replacement), globalFlag, shellQuote(path))
+			expr := fmt.Sprintf("'s/%s/%s/%s'",
+				sedEscapePattern(pattern), sedEscapeReplacement(replacement), globalFlag)
+			cmd = sedInPlace("-E", expr, path)
 
 		case "insert":
 			lineNum := req.GetInt("line", 0)
@@ -243,8 +240,8 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			if content == "" {
 				return mcp.NewToolResultError("'content' is required for insert operation"), nil
 			}
-			cmd = fmt.Sprintf("sed -i '%di\\%s' %s 2>&1",
-				lineNum, sedEscapeInsertText(content), shellQuote(path))
+			expr := fmt.Sprintf("'%di\\%s'", lineNum, sedEscapeInsertText(content))
+			cmd = sedInPlace("", expr, path)
 
 		case "append":
 			content := req.GetString("content", "")
@@ -254,8 +251,9 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			}
 			if pattern != "" {
 				// Append after line matching pattern
-				cmd = fmt.Sprintf("sed -i '/%s/a\\%s' %s 2>&1",
-					sedEscapePattern(pattern), sedEscapeInsertText(content), shellQuote(path))
+				expr := fmt.Sprintf("'/%s/a\\%s'",
+					sedEscapePattern(pattern), sedEscapeInsertText(content))
+				cmd = sedInPlace("", expr, path)
 			} else {
 				// Append at end of file
 				cmd = fmt.Sprintf("printf '\\n%%s' %s >> %s 2>&1",
@@ -270,12 +268,13 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			}
 			if pattern != "" {
 				// Insert before line matching pattern
-				cmd = fmt.Sprintf("sed -i '/%s/i\\%s' %s 2>&1",
-					sedEscapePattern(pattern), sedEscapeInsertText(content), shellQuote(path))
+				expr := fmt.Sprintf("'/%s/i\\%s'",
+					sedEscapePattern(pattern), sedEscapeInsertText(content))
+				cmd = sedInPlace("", expr, path)
 			} else {
 				// Prepend at start of file
-				cmd = fmt.Sprintf("sed -i '1i\\%s' %s 2>&1",
-					sedEscapeInsertText(content), shellQuote(path))
+				expr := fmt.Sprintf("'1i\\%s'", sedEscapeInsertText(content))
+				cmd = sedInPlace("", expr, path)
 			}
 
 		case "delete":
@@ -285,16 +284,16 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 			if pattern != "" {
 				// Delete lines matching pattern
-				cmd = fmt.Sprintf("sed -i '/%s/d' %s 2>&1",
-					sedEscapePattern(pattern), shellQuote(path))
+				expr := fmt.Sprintf("'/%s/d'", sedEscapePattern(pattern))
+				cmd = sedInPlace("", expr, path)
 			} else if startLine > 0 && endLine > 0 {
 				// Delete line range
-				cmd = fmt.Sprintf("sed -i '%d,%dd' %s 2>&1",
-					startLine, endLine, shellQuote(path))
+				expr := fmt.Sprintf("'%d,%dd'", startLine, endLine)
+				cmd = sedInPlace("", expr, path)
 			} else if startLine > 0 {
 				// Delete single line
-				cmd = fmt.Sprintf("sed -i '%dd' %s 2>&1",
-					startLine, shellQuote(path))
+				expr := fmt.Sprintf("'%dd'", startLine)
+				cmd = sedInPlace("", expr, path)
 			} else {
 				return mcp.NewToolResultError("'pattern' or 'start_line' is required for delete operation"), nil
 			}
@@ -305,19 +304,17 @@ func createEditHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			if pattern == "" {
 				return mcp.NewToolResultError("'pattern' is required for replace_line operation"), nil
 			}
-			cmd = fmt.Sprintf("sed -i -E 's/%s/%s/' %s 2>&1",
-				sedEscapePattern(pattern), sedEscapeReplacement(content), shellQuote(path))
+			expr := fmt.Sprintf("'s/%s/%s/'",
+				sedEscapePattern(pattern), sedEscapeReplacement(content))
+			cmd = sedInPlace("-E", expr, path)
 
 		default:
 			return mcp.NewToolResultError(fmt.Sprintf(
 				"Unknown operation: '%s'. Supported: replace, regex, insert, append, prepend, delete, replace_line", operation)), nil
 		}
 
-		log.Printf("[Tool:edit] %s on %s: %s", operation, path, cmd)
-
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
-			log.Printf("[Tool:edit] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -362,7 +359,6 @@ func createListDirHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		files, err := mgr.ListDir(ctx, path, target)
 		if err != nil {
-			log.Printf("[Tool:list_dir] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -423,7 +419,6 @@ func createValidateHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 		// Read file content via SFTP
 		content, err := mgr.ReadFile(ctx, path, target)
 		if err != nil {
-			log.Printf("[Tool:validate] Error reading file: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -433,7 +428,6 @@ func createValidateHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(fmt.Sprintf("No server-side validator for type '%s'", fileType)), nil
 		}
 
-		log.Printf("[Tool:validate] %s %s: valid=%v", fileType, path, result.Valid)
 		return mcp.NewToolResultText(result.FormatResult(path)), nil
 	}
 }

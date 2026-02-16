@@ -1,5 +1,6 @@
 # Binary
 ssh-mcp
+/server
 
 # Data & Keys (Persistent storage for local runs)
 data/

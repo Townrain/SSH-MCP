@@ -73,9 +73,9 @@ func createNetStatHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		var cmd string
 		if port > 0 {
-			cmd = fmt.Sprintf("ss -tlnp 2>/dev/null | grep ':%d ' || netstat -tlnp 2>/dev/null | grep ':%d '", port, port)
+			cmd = fmt.Sprintf("ss -tlnp 2>/dev/null | grep ':%d ' || netstat -an 2>/dev/null | grep -i listen | grep '[\\.: ]%d '", port, port)
 		} else {
-			cmd = "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"
+			cmd = "ss -tlnp 2>/dev/null || netstat -an 2>/dev/null | grep -i listen"
 		}
 
 		output, err := mgr.Execute(ctx, cmd, target)

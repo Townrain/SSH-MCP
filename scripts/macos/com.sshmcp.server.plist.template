@@ -23,8 +23,6 @@
     <string>http</string>
     <key>PORT</key>
     <string>__PORT__</string>
-    <key>SSH_MCP_DEBUG</key>
-    <string>__DEBUG__</string>
     <key>SSH_MCP_GLOBAL</key>
     <string>__GLOBAL__</string>
   </dict>

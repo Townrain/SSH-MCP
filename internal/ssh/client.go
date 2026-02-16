@@ -54,6 +54,12 @@ func (c *Client) connect(jumpClient *Client) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Close stale SFTP client before closing the connection
+	if c.sftp != nil {
+		c.sftp.Close()
+		c.sftp = nil
+	}
+
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
@@ -111,13 +117,12 @@ func (c *Client) connect(jumpClient *Client) error {
 
 	output, err := c.runRaw("pwd")
 	if err != nil {
-		log.Printf("[SSH] Warning: failed to get initial CWD: %v", err)
 		c.cwd = "~"
 	} else {
 		c.cwd = strings.TrimSpace(output)
 	}
 
-	log.Printf("[SSH] Connected to %s@%s (alias: %s)", c.creds.Username, c.creds.Host, c.alias)
+	log.Printf("ssh: connected %s@%s (%s)", c.creds.Username, c.creds.Host, c.alias)
 	return nil
 }
 
@@ -167,16 +172,24 @@ func (c *Client) Run(ctx context.Context, cmd string) (*RunResult, error) {
 	}
 	resultChan := make(chan readResult, 1)
 
+	const maxStdout = 10 * 1024 * 1024 // 10 MB
+	const maxStderr = 1 * 1024 * 1024  // 1 MB
 	go func() {
-		stdoutBytes, _ := io.ReadAll(stdout)
-		stderrBytes, _ := io.ReadAll(stderr)
+		stdoutBytes, _ := io.ReadAll(io.LimitReader(stdout, maxStdout))
+		stderrBytes, _ := io.ReadAll(io.LimitReader(stderr, maxStderr))
 		resultChan <- readResult{stdout: stdoutBytes, stderr: stderrBytes}
 	}()
 
 	var res readResult
 	select {
 	case <-ctx.Done():
-		session.Signal(ssh.SIGKILL)
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close() // Unblock io.ReadAll by closing pipes
+		// Wait briefly for the reader goroutine to finish
+		select {
+		case <-resultChan:
+		case <-time.After(2 * time.Second):
+		}
 		return nil, ctx.Err()
 	case res = <-resultChan:
 	}
@@ -271,7 +284,7 @@ func (c *Client) CWD() string {
 
 // Reconnect attempts to reconnect.
 func (c *Client) Reconnect(jumpClient *Client) error {
-	log.Printf("[SSH] Reconnecting %s...", c.alias)
+	log.Printf("ssh: reconnecting %s", c.alias)
 	return c.connect(jumpClient)
 }
 

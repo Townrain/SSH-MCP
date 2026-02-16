@@ -12,7 +12,6 @@ LOG_DIR="${APP_SUPPORT_DIR}/logs"
 WORK_DIR="${SSH_MCP_WORK_DIR:-${APP_SUPPORT_DIR}}"
 BINARY_PATH="${SSH_MCP_BINARY_PATH:-${APP_SUPPORT_DIR}/bin/ssh-mcp}"
 PORT="${PORT:-11760}"
-DEBUG="${SSH_MCP_DEBUG:-false}"
 GLOBAL="${SSH_MCP_GLOBAL:-false}"
 
 launch_target() {
@@ -31,7 +30,6 @@ render_plist() {
     -e "s|__BINARY__|${BINARY_PATH}|g" \
     -e "s|__PORT__|${PORT}|g" \
     -e "s|__WORKDIR__|${WORK_DIR}|g" \
-    -e "s|__DEBUG__|${DEBUG}|g" \
     -e "s|__GLOBAL__|${GLOBAL}|g" \
     -e "s|__STDOUT__|${LOG_DIR}/stdout.log|g" \
     -e "s|__STDERR__|${LOG_DIR}/stderr.log|g" \
@@ -130,7 +128,8 @@ health_service() {
 
 uninstall_service() {
   stop_service >/dev/null 2>&1 || true
-  launchctl disable "$(launch_target)" >/dev/null 2>&1 || true
+  # Re-enable before removing so next install doesn't hit "disabled" state
+  launchctl enable "$(launch_target)" >/dev/null 2>&1 || true
   rm -f "${PLIST_PATH}"
   echo "Removed ${LABEL} and deleted ${PLIST_PATH}"
 }
@@ -155,7 +154,6 @@ Environment overrides:
   SSH_MCP_APP_SUPPORT_DIR Runtime base dir (default: ~/Library/Application Support/ssh-mcp)
   SSH_MCP_WORK_DIR        Working directory for process (default: APP_SUPPORT_DIR)
   SSH_MCP_BINARY_PATH     Binary location (default: APP_SUPPORT_DIR/bin/ssh-mcp)
-  SSH_MCP_DEBUG           true/false (default: false)
   SSH_MCP_GLOBAL          true/false (default: false)
 EOF
 }

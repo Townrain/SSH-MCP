@@ -6,33 +6,39 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
 // Manager manages multiple SSH connections for a single session.
 type Manager struct {
-	connections map[string]*Client
-	primary     string
-	keyManager  *KeyManager
-	mu          sync.RWMutex
-	aliasLocks  map[string]*sync.Mutex
+	connections    map[string]*Client
+	primary        string
+	keyManager     *KeyManager
+	mu             sync.RWMutex
+	aliasLocks     map[string]*sync.Mutex
+	reconnectFails map[string]time.Time // alias -> last failed reconnect time
+	dockerCache    map[string]*bool     // alias -> docker available (nil = unknown)
 }
 
 // NewManager creates a new SSH connection manager.
 func NewManager(keyPath string) *Manager {
 	mgr := &Manager{
-		connections: make(map[string]*Client),
-		keyManager:  NewKeyManager(keyPath),
-		aliasLocks:  make(map[string]*sync.Mutex),
+		connections:    make(map[string]*Client),
+		keyManager:     NewKeyManager(keyPath),
+		aliasLocks:     make(map[string]*sync.Mutex),
+		reconnectFails: make(map[string]time.Time),
+		dockerCache:    make(map[string]*bool),
 	}
 
 	if err := mgr.keyManager.EnsureKey(); err != nil {
-		log.Printf("[Manager] Warning: %v", err)
+		log.Printf("manager: key setup warning: %v", err)
 	}
 
 	return mgr
@@ -163,7 +169,7 @@ func (m *Manager) Connect(ctx context.Context, opts ConnectOptions) (alias strin
 			return "", fmt.Errorf("no auth provided and system key unavailable: %w", err)
 		}
 		creds.PrivateKey = signer
-		log.Printf("[Manager] Using system key for %s", opts.Alias)
+		log.Printf("ssh: using system key for %s", opts.Alias)
 	}
 
 	var jumpClient *Client
@@ -204,6 +210,9 @@ func (m *Manager) Disconnect(alias string) (string, error) {
 				count++
 			}
 			delete(m.connections, a)
+			delete(m.aliasLocks, a)
+			delete(m.reconnectFails, a)
+			delete(m.dockerCache, a)
 		}
 		m.primary = ""
 		return fmt.Sprintf("Disconnected all (%d) connections", count), nil
@@ -218,6 +227,9 @@ func (m *Manager) Disconnect(alias string) (string, error) {
 		client.Close()
 	}
 	delete(m.connections, alias)
+	delete(m.aliasLocks, alias)
+	delete(m.reconnectFails, alias)
+	delete(m.dockerCache, alias)
 
 	if m.primary == alias {
 		m.primary = ""
@@ -276,10 +288,25 @@ func (m *Manager) Run(ctx context.Context, cmd, target string) (*RunResult, erro
 	result, err := client.Run(ctx, cmd)
 	if err != nil {
 		if isConnectionError(err) {
-			log.Printf("[Manager] Connection lost for %s, reconnecting...", alias)
+			// Check reconnect backoff
+			m.mu.RLock()
+			lastFail := m.reconnectFails[alias]
+			m.mu.RUnlock()
+			if time.Since(lastFail) < 5*time.Second {
+				return nil, fmt.Errorf("connection lost (reconnect backoff): %w", err)
+			}
+
+			log.Printf("ssh: connection lost for %s, reconnecting", alias)
 			if reconnErr := client.Reconnect(m.getJumpClient(client.creds.Via)); reconnErr != nil {
+				m.mu.Lock()
+				m.reconnectFails[alias] = time.Now()
+				m.mu.Unlock()
 				return nil, fmt.Errorf("reconnect failed: %w", reconnErr)
 			}
+			// Clear backoff on success
+			m.mu.Lock()
+			delete(m.reconnectFails, alias)
+			m.mu.Unlock()
 			return client.Run(ctx, cmd)
 		}
 		return nil, err
@@ -303,11 +330,22 @@ func isConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
+
+	// Type-safe checks first
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	// String matching for SSH-specific errors
 	errStr := err.Error()
 	return strings.Contains(errStr, "connection reset") ||
 		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "EOF") ||
-		strings.Contains(errStr, "connection refused")
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "use of closed network connection")
 }
 
 // Execute runs a command and returns formatted output.
@@ -422,6 +460,16 @@ func (m *Manager) ReadFile(ctx context.Context, path, target string) (string, er
 		return "", fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
+
+	// Check file size before reading to prevent OOM
+	const maxReadSize = 10 * 1024 * 1024 // 10 MB
+	stat, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("failed to stat file: %w", err)
+	}
+	if stat.Size() > maxReadSize {
+		return "", fmt.Errorf("file too large (%d bytes, max %d bytes); use 'run' with head/tail to read portions", stat.Size(), maxReadSize)
+	}
 
 	content, err := io.ReadAll(file)
 	if err != nil {
@@ -544,6 +592,34 @@ func (m *Manager) ListConnections() []string {
 	return aliases
 }
 
+// IsDockerAvailable checks if Docker is available on the target, with per-alias caching.
+func (m *Manager) IsDockerAvailable(ctx context.Context, target string) (bool, error) {
+	alias, err := m.resolveTarget(target)
+	if err != nil {
+		return false, err
+	}
+
+	m.mu.RLock()
+	cached := m.dockerCache[alias]
+	m.mu.RUnlock()
+
+	if cached != nil {
+		return *cached, nil
+	}
+
+	output, err := m.Execute(ctx, "command -v docker >/dev/null 2>&1 && echo 'ok' || echo 'missing'", target)
+	if err != nil {
+		return false, err
+	}
+
+	available := strings.Contains(output, "ok")
+	m.mu.Lock()
+	m.dockerCache[alias] = &available
+	m.mu.Unlock()
+
+	return available, nil
+}
+
 // Close closes all connections.
 func (m *Manager) Close() {
 	m.mu.Lock()
@@ -555,5 +631,8 @@ func (m *Manager) Close() {
 		}
 	}
 	m.connections = make(map[string]*Client)
+	m.aliasLocks = make(map[string]*sync.Mutex)
+	m.reconnectFails = make(map[string]time.Time)
+	m.dockerCache = make(map[string]*bool)
 	m.primary = ""
 }

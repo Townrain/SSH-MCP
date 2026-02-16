@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"ssh-mcp/internal/ssh"
 
@@ -100,11 +99,11 @@ func createUsageHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		cmd := `
 echo "=== LOAD AVERAGE ==="
-cat /proc/loadavg 2>/dev/null
+uptime 2>/dev/null
 
 echo ""
 echo "=== MEMORY ==="
-free -h 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -5
+free -h 2>/dev/null || top -l 1 -s 0 2>/dev/null | grep -i phys || cat /proc/meminfo 2>/dev/null | head -5
 
 echo ""
 echo "=== DISK ==="
@@ -134,12 +133,12 @@ func createPsHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			limit = 50
 		}
 
-		sortFlag := "-%cpu"
+		sortCol := "3" // %cpu is column 3
 		if sortBy == "mem" {
-			sortFlag = "-%mem"
+			sortCol = "4" // %mem is column 4
 		}
 
-		cmd := fmt.Sprintf("ps -eo pid,user,%%cpu,%%mem,comm --sort=%s | head -n %d", sortFlag, limit+1)
+		cmd := fmt.Sprintf("ps -eo pid,user,%%cpu,%%mem,comm | awk 'NR==1{print} NR>1{print | \"sort -k%s -rn\"}' | head -n %d", sortCol, limit+1)
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -216,7 +215,7 @@ func createJournalReadHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 			}
 			cmd += fmt.Sprintf(" -n %d 2>/dev/null", lines)
 		} else {
-			cmd = fmt.Sprintf("cat /var/log/syslog /var/log/messages 2>/dev/null | tail -n %d", lines)
+			cmd = fmt.Sprintf("cat /var/log/syslog /var/log/messages /var/log/system.log 2>/dev/null | tail -n %d", lines)
 			if service != "" {
 				cmd += fmt.Sprintf(" | grep -i %s", shellQuote(service))
 			}
@@ -275,16 +274,16 @@ echo "=== SYSTEM HEALTH DIAGNOSTIC ==="
 echo ""
 
 echo "--- LOAD AVERAGE ---"
-LOAD=$(cat /proc/loadavg 2>/dev/null | awk '{print $1}')
-CPUS=$(nproc 2>/dev/null || echo 1)
+LOAD=$(uptime 2>/dev/null | awk -F'load average[s]?: ' '{print $2}' | awk -F'[, ]' '{print $1}')
+CPUS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 echo "Load (1min): $LOAD (CPUs: $CPUS)"
-if [ $(echo "$LOAD > $((CPUS * 2))" | bc 2>/dev/null) = 1 ] 2>/dev/null; then
+if echo "$LOAD $CPUS" | awk '{if ($1 > $2 * 2) exit 0; else exit 1}'; then
   echo "WARNING: High load detected!"
 fi
 echo ""
 
 echo "--- TOP CPU CONSUMERS ---"
-ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu 2>/dev/null | head -n 6
+ps -eo pid,user,%cpu,%mem,comm | awk 'NR==1{print} NR>1{print | "sort -k3 -rn"}' | head -n 6
 echo ""
 
 echo "--- OOM EVENTS ---"
@@ -323,7 +322,6 @@ echo "=== END DIAGNOSTIC ==="
 `
 		output, err := mgr.Execute(ctx, cmd, target)
 		if err != nil {
-			log.Printf("[Tool:diagnose] Error: %v", err)
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
@@ -343,9 +341,9 @@ func createListServicesHandler(pool *ssh.Pool) server.ToolHandlerFunc {
 
 		var cmd string
 		if failedOnly {
-			cmd = "systemctl --failed --no-pager 2>/dev/null || rc-status --crashed 2>/dev/null"
+			cmd = `if command -v systemctl >/dev/null 2>&1; then systemctl --failed --no-pager 2>/dev/null; elif command -v rc-status >/dev/null 2>&1; then rc-status --crashed 2>/dev/null; elif command -v launchctl >/dev/null 2>&1; then launchctl list 2>/dev/null | head -50; else echo "No supported init system detected"; fi`
 		} else {
-			cmd = "systemctl list-units --type=service --no-pager 2>/dev/null | head -50 || rc-status 2>/dev/null"
+			cmd = `if command -v systemctl >/dev/null 2>&1; then systemctl list-units --type=service --no-pager 2>/dev/null | head -50; elif command -v rc-status >/dev/null 2>&1; then rc-status 2>/dev/null; elif command -v launchctl >/dev/null 2>&1; then launchctl list 2>/dev/null | head -50; elif [ -x /usr/sbin/service ]; then service -e 2>/dev/null | head -50; else echo "No supported init system detected"; fi`
 		}
 
 		output, err := mgr.Execute(ctx, cmd, target)
