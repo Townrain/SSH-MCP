@@ -29,7 +29,7 @@ func registerNetworkTools(s *server.MCPServer, pool *ssh.Pool) {
 			mcp.WithString("pattern", mcp.Required(), mcp.Description("File name pattern (supports wildcards)")),
 			mcp.WithString("path", mcp.Description("Search path (default: /)")),
 			mcp.WithNumber("max_depth", mcp.Description("Maximum directory depth")),
-			mcp.WithString("type", mcp.Description("File type: f (file), d (directory)")),
+			mcp.WithString("type", mcp.Description("Filter by type: f (file), d (directory)"), mcp.Enum("f", "d")),
 			mcp.WithString("target", mcp.Description("Connection alias (default: primary)")),
 		),
 		createSearchFilesHandler(pool),
@@ -53,7 +53,7 @@ func registerNetworkTools(s *server.MCPServer, pool *ssh.Pool) {
 	s.AddTool(
 		mcp.NewTool("package_manage",
 			mcp.WithDescription("Install/remove/check packages (apt, apk, dnf, yum)"),
-			mcp.WithString("action", mcp.Required(), mcp.Description("Action: install, remove, check, list")),
+			mcp.WithString("action", mcp.Required(), mcp.Description("Package management action"), mcp.Enum("install", "remove", "check", "list")),
 			mcp.WithString("package", mcp.Description("Package name (required for install/remove/check)")),
 			mcp.WithString("target", mcp.Description("Connection alias (default: primary)")),
 		),

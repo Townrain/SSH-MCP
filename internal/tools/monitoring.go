@@ -25,7 +25,7 @@ func registerMonitoringTools(s *server.MCPServer, pool *ssh.Pool) {
 	s.AddTool(
 		mcp.NewTool("ps",
 			mcp.WithDescription("List top processes sorted by CPU or memory"),
-			mcp.WithString("sort_by", mcp.Description("Sort by 'cpu' or 'mem' (default: cpu)")),
+			mcp.WithString("sort_by", mcp.Description("Sort field (default: cpu)"), mcp.Enum("cpu", "mem")),
 			mcp.WithNumber("limit", mcp.Description("Number of processes to show (default: 10)")),
 			mcp.WithString("target", mcp.Description("Connection alias (default: primary)")),
 		),
@@ -51,7 +51,7 @@ func registerMonitoringTools(s *server.MCPServer, pool *ssh.Pool) {
 			mcp.WithString("service", mcp.Description("Service name to filter (e.g., nginx, sshd)")),
 			mcp.WithString("since", mcp.Description("Time filter (e.g., '1 hour ago')")),
 			mcp.WithNumber("lines", mcp.Description("Number of lines (default: 100, max: 500)")),
-			mcp.WithString("priority", mcp.Description("Log priority: emerg, alert, crit, err, warning, notice, info, debug")),
+			mcp.WithString("priority", mcp.Description("Minimum log priority level"), mcp.Enum("emerg", "alert", "crit", "err", "warning", "notice", "info", "debug")),
 			mcp.WithString("target", mcp.Description("Connection alias (default: primary)")),
 		),
 		createJournalReadHandler(pool),

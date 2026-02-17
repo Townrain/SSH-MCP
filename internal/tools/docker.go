@@ -38,7 +38,7 @@ func registerDockerTools(s *server.MCPServer, pool *ssh.Pool) {
 		mcp.NewTool("docker_op",
 			mcp.WithDescription("Start, stop, or restart a Docker container"),
 			mcp.WithString("container", mcp.Required(), mcp.Description("Container name or ID")),
-			mcp.WithString("action", mcp.Required(), mcp.Description("Action: start, stop, restart")),
+			mcp.WithString("action", mcp.Required(), mcp.Description("Action to perform on the container"), mcp.Enum("start", "stop", "restart")),
 			mcp.WithString("target", mcp.Description("Connection alias (default: primary)")),
 		),
 		createDockerOpHandler(pool),

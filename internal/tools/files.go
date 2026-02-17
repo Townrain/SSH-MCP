@@ -61,7 +61,7 @@ Examples:
   operation=replace_line, pattern="^server_name.*", content="server_name example.com;"
 `),
 			mcp.WithString("path", mcp.Required(), mcp.Description("File path to edit")),
-			mcp.WithString("operation", mcp.Description("Operation: replace, regex, insert, append, prepend, delete, replace_line (default: replace)")),
+			mcp.WithString("operation", mcp.Description("Edit operation (default: replace)"), mcp.Enum("replace", "regex", "insert", "append", "prepend", "delete", "replace_line")),
 			// For replace operation
 			mcp.WithString("old_text", mcp.Description("Text to find (for 'replace' operation)")),
 			mcp.WithString("new_text", mcp.Description("Replacement text (for 'replace' operation)")),
@@ -96,7 +96,7 @@ Supported formats:
 
 All validation runs on the MCP server using Go parsers. No python3, jq, or other tools needed on the remote host.`),
 			mcp.WithString("path", mcp.Required(), mcp.Description("File path to validate")),
-			mcp.WithString("type", mcp.Description("Force file type: json, yaml, toml, xml, ini, env, dockerfile (auto-detected from extension if omitted)")),
+			mcp.WithString("type", mcp.Description("Force file type (auto-detected from extension if omitted)"), mcp.Enum("json", "yaml", "toml", "xml", "ini", "env", "dockerfile")),
 			mcp.WithString("target", mcp.Description("Connection alias (default: primary)")),
 		),
 		createValidateHandler(pool),
